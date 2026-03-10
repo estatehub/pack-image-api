@@ -3,29 +3,57 @@ const sharp = require('sharp');
 const PADDING = 20;
 const BACKGROUND_COLOR = { r: 54, g: 57, b: 63, alpha: 1 };
 const TARGET_HEIGHT = 1024;
+const FETCH_TIMEOUT = 15000; // 15 seconds per image
 
-async function createPlaceholderImage(isSpecial = false) {
+async function fetchWithTimeout(url, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    clearTimeout(timer);
+    return response;
+  } catch (error) {
+    clearTimeout(timer);
+    throw error;
+  }
+}
+
+async function fetchImageBuffer(url) {
+  // Try up to 2 times
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const response = await fetchWithTimeout(url, FETCH_TIMEOUT);
+      if (!response.ok) {
+        console.warn(`Fetch attempt ${attempt} failed for ${url}: HTTP ${response.status}`);
+        if (attempt === 2) return null;
+        continue;
+      }
+      return Buffer.from(await response.arrayBuffer());
+    } catch (error) {
+      console.warn(`Fetch attempt ${attempt} error for ${url}: ${error.message}`);
+      if (attempt === 2) return null;
+    }
+  }
+  return null;
+}
+
+async function createPlaceholderImage() {
   const width = Math.round(TARGET_HEIGHT * 0.7);
-  const color = isSpecial
-    ? { r: 0, g: 0, b: 0, alpha: 1 }
-    : { r: 85, g: 85, b: 85, alpha: 1 };
-
   return sharp({
-    create: { width, height: TARGET_HEIGHT, channels: 4, background: color }
+    create: { width, height: TARGET_HEIGHT, channels: 4, background: { r: 85, g: 85, b: 85, alpha: 1 } }
   }).png().toBuffer();
 }
 
 async function processCardImage(imageUrl, isSpecial = false) {
   try {
-    if (!imageUrl) return createPlaceholderImage(isSpecial);
+    if (!imageUrl) return createPlaceholderImage();
 
-    const response = await fetch(imageUrl);
-    if (!response.ok) {
-      console.warn(`Failed to fetch image from ${imageUrl}: ${response.status}`);
-      return createPlaceholderImage(isSpecial);
+    const imageBuffer = await fetchImageBuffer(imageUrl);
+    if (!imageBuffer) {
+      console.warn(`All fetch attempts failed for ${imageUrl}, using placeholder`);
+      return createPlaceholderImage();
     }
 
-    const imageBuffer = Buffer.from(await response.arrayBuffer());
     let image = sharp(imageBuffer).resize({
       height: TARGET_HEIGHT,
       fit: 'contain',
@@ -40,7 +68,7 @@ async function processCardImage(imageUrl, isSpecial = false) {
     return image.png({ compressionLevel: 6 }).toBuffer();
   } catch (error) {
     console.error(`Error processing image ${imageUrl}:`, error);
-    return createPlaceholderImage(isSpecial);
+    return createPlaceholderImage();
   }
 }
 
@@ -58,6 +86,8 @@ module.exports = async function handler(req, res) {
       res.status(400).json({ error: 'No card URLs provided. Use ?url=... query parameters.' });
       return;
     }
+
+    console.log(`Processing ${cardUrls.length} cards, specials: [${specialIndices.join(',')}]`);
 
     // Process all cards in parallel
     const cardImages = await Promise.all(
@@ -97,6 +127,8 @@ module.exports = async function handler(req, res) {
       .composite(compositeOps)
       .png({ compressionLevel: 6 })
       .toBuffer();
+
+    console.log(`Image generated: ${totalWidth}x${maxHeight}, ${resultBuffer.length} bytes`);
 
     // Return the image
     res.setHeader('Content-Type', 'image/png');
